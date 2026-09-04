@@ -1,0 +1,2564 @@
+#!/usr/bin/env python3
+# BB iOS – Complete Installer with Custom Provider Support
+# Version: 1.1.0
+# New: Users can add arbitrary OpenAI-compatible API providers.
+
+import os
+import sys
+from pathlib import Path
+
+BASE = Path(__file__).parent / "bb_ios"
+VERSION = "1.1.0"
+
+def write_file(rel_path: str, content: str, executable: bool = False):
+    full = BASE / rel_path
+    full.parent.mkdir(parents=True, exist_ok=True)
+    full.write_text(content, encoding="utf-8")
+    if executable:
+        full.chmod(0o755)
+
+# ============================================================
+# 1. server.py (updated with provider management endpoints)
+# ============================================================
+write_file("server.py", '''#!/usr/bin/env python3
+\"\"\"BB iOS – Main FastAPI server (v1.1.0).\"\"\"
+import asyncio
+import json
+import secrets
+import uuid
+from pathlib import Path
+from fastapi import FastAPI, Request, HTTPException, Depends, Header
+from fastapi.responses import HTMLResponse, StreamingResponse, JSONResponse
+from fastapi.staticfiles import StaticFiles
+import uvicorn
+
+from bb.core.runtime import BBRuntime
+from bb.core.context_builder import ContextBuilder
+from bb.core.models import Message, MessageRole
+from bb.core.credentials import CredentialManager
+from bb.ios.keychain import KeychainManager
+from bb.weaver.adapter import WeaverAdapter
+
+app = FastAPI(title="BB iOS", version="1.1.0")
+app.mount("/static", StaticFiles(directory="static"), name="static")
+
+DATA_PATH = Path(__file__).parent / "data"
+DATA_PATH.mkdir(exist_ok=True)
+
+VAULT_PATH = DATA_PATH / "vault"
+VAULT_PATH.mkdir(exist_ok=True)
+
+runtime = BBRuntime(DATA_PATH, VAULT_PATH)
+
+CONFIG_PATH = DATA_PATH / "config.json"
+if CONFIG_PATH.exists():
+    with open(CONFIG_PATH) as f:
+        CONFIG = json.load(f)
+else:
+    CONFIG = {"local_auth_token": secrets.token_urlsafe(32)}
+    with open(CONFIG_PATH, "w") as f:
+        json.dump(CONFIG, f, indent=2)
+LOCAL_AUTH_TOKEN = CONFIG["local_auth_token"]
+
+def verify_token(x_api_key: str = Header(...)):
+    if x_api_key != LOCAL_AUTH_TOKEN:
+        raise HTTPException(status_code=401, detail="Invalid API key")
+
+@app.on_event("startup")
+async def startup():
+    await runtime.start()
+
+@app.on_event("shutdown")
+async def shutdown():
+    await runtime.stop()
+
+@app.get("/")
+async def root():
+    return HTMLResponse(open("static/index.html").read())
+
+@app.post("/chat")
+async def chat(
+    request: Request,
+    auth: str = Depends(verify_token)
+):
+    body = await request.json()
+    user_input = body.get("text", "")
+    session_id = body.get("session_id", str(uuid.uuid4()))
+    agent_id = body.get("agent_id", "fable")
+
+    queue = runtime.events.create_sse_queue(session_id)
+
+    async def producer():
+        try:
+            await runtime.events.emit("session.start", {"session_id": session_id}, session_id=session_id)
+            async for event in runtime.process(user_input, session_id, agent_id):
+                await runtime.events.emit(event.type, event.__dict__, session_id=session_id)
+            await runtime.events.emit("session.end", {}, session_id=session_id)
+        except Exception as e:
+            await runtime.events.emit("error", {"content": str(e)}, session_id=session_id)
+            await runtime.events.emit("session.end", {}, session_id=session_id)
+
+    async def event_generator():
+        producer_task = asyncio.create_task(producer())
+        try:
+            while True:
+                try:
+                    event = await asyncio.wait_for(queue.get(), timeout=1.0)
+                    yield f"data: {json.dumps(event)}\\n\\n"
+                    if event.get("type") == "session.end":
+                        break
+                except asyncio.TimeoutError:
+                    yield ": keepalive\\n\\n"
+        except asyncio.CancelledError:
+            pass
+        finally:
+            producer_task.cancel()
+            runtime.events.remove_sse_queue(session_id)
+
+    return StreamingResponse(event_generator(), media_type="text/event-stream")
+
+@app.post("/approve")
+async def approve_tool(request: Request, auth: str = Depends(verify_token)):
+    body = await request.json()
+    approval_id = body.get("approval_id")
+    decision = body.get("decision")
+    if decision == "allow":
+        runtime.gateway.approve(approval_id)
+        return JSONResponse({"status": "approved"})
+    else:
+        runtime.gateway.deny_approval(approval_id)
+        return JSONResponse({"status": "denied"})
+
+@app.post("/take_the_wheel")
+async def take_the_wheel(auth: str = Depends(verify_token)):
+    await runtime.set_human_override(True)
+    return JSONResponse({"status": "human_override_enabled"})
+
+@app.post("/release_the_wheel")
+async def release_the_wheel(auth: str = Depends(verify_token)):
+    await runtime.set_human_override(False)
+    return JSONResponse({"status": "human_override_disabled"})
+
+@app.get("/audit")
+async def get_audit(auth: str = Depends(verify_token)):
+    logs = runtime.audit.get_recent(20)
+    return JSONResponse({"logs": logs})
+
+@app.get("/agents")
+async def list_agents(auth: str = Depends(verify_token)):
+    return JSONResponse({
+        "agents": [
+            {"id": agent.id, "name": agent.name, "provider": agent.provider, "model": agent.model}
+            for agent in runtime.agents.values()
+        ]
+    })
+
+@app.post("/set_vault")
+async def set_vault(request: Request, auth: str = Depends(verify_token)):
+    body = await request.json()
+    vault_path = Path(body.get("path", ""))
+    if not vault_path.exists():
+        return JSONResponse({"error": "Path does not exist"}, status_code=400)
+    runtime.weaver = WeaverAdapter(vault_path)
+    runtime.context_builder = ContextBuilder(runtime.weaver)
+    await runtime.weaver.index()
+    return JSONResponse({"status": "vault_updated", "path": str(vault_path)})
+
+@app.post("/key")
+async def set_key(request: Request, auth: str = Depends(verify_token)):
+    body = await request.json()
+    provider = body.get("provider")
+    key = body.get("key")
+    if not provider or not key:
+        return JSONResponse({"error": "provider and key required"}, status_code=400)
+    KeychainManager.set_key(provider, key)
+    return JSONResponse({"status": "key_set", "provider": provider})
+
+@app.get("/key/{provider}")
+async def get_key(provider: str, auth: str = Depends(verify_token)):
+    has = KeychainManager.get_key(provider) is not None
+    return JSONResponse({"has_key": has})
+
+@app.delete("/key/{provider}")
+async def delete_key(provider: str, auth: str = Depends(verify_token)):
+    KeychainManager.delete_key(provider)
+    return JSONResponse({"status": "deleted"})
+
+@app.post("/share")
+async def share(request: Request, auth: str = Depends(verify_token)):
+    body = await request.json()
+    content = body.get("content", "")
+    title = body.get("title", "")
+    session_id = body.get("session_id") or str(uuid.uuid4())
+    agent_id = body.get("agent_id", "fable")
+    if not content:
+        return JSONResponse({"error": "content required"}, status_code=400)
+    prompt = f"Shared content:\\nTitle: {title}\\n\\n{content}"
+    final_answer = []
+    async for event in runtime.process(prompt, session_id, agent_id):
+        if event.type == "text":
+            final_answer.append(event.text or "")
+        elif event.type == "done":
+            break
+    return JSONResponse({
+        "status": "processed",
+        "session_id": session_id,
+        "answer": "".join(final_answer) if final_answer else "No response"
+    })
+
+# -------- Provider Management Endpoints --------
+@app.get("/providers")
+async def list_providers(auth: str = Depends(verify_token)):
+    providers = runtime.router.list_providers()
+    custom = runtime.router._custom_provider_configs
+    return JSONResponse({
+        "providers": providers,
+        "custom": custom
+    })
+
+@app.post("/providers/custom")
+async def add_custom_provider(request: Request, auth: str = Depends(verify_token)):
+    body = await request.json()
+    name = body.get("name")
+    base_url = body.get("base_url")
+    api_key = body.get("api_key", "")
+    model = body.get("model", "default")
+    if not name or not base_url:
+        return JSONResponse({"error": "name and base_url required"}, status_code=400)
+    runtime.router.add_custom_provider(name, base_url, api_key, model)
+    return JSONResponse({"status": "added", "name": name})
+
+@app.delete("/providers/custom/{name}")
+async def delete_custom_provider(name: str, auth: str = Depends(verify_token)):
+    runtime.router.delete_custom_provider(name)
+    return JSONResponse({"status": "deleted", "name": name})
+
+# -------- Agent Management --------
+@app.post("/agents/{agent_id}/provider")
+async def set_agent_provider(agent_id: str, request: Request, auth: str = Depends(verify_token)):
+    body = await request.json()
+    provider = body.get("provider")
+    model = body.get("model")
+    agent = runtime.get_agent(agent_id)
+    if not agent:
+        return JSONResponse({"error": "Agent not found"}, status_code=404)
+    if provider:
+        agent.provider = provider
+    if model:
+        agent.model = model
+    return JSONResponse({"status": "updated", "agent": agent_id, "provider": agent.provider, "model": agent.model})
+
+if __name__ == "__main__":
+    print(f"BB iOS v{VERSION}")
+    print(f"Local auth token: {LOCAL_AUTH_TOKEN}")
+    print("Server starting on http://0.0.0.0:5100")
+    uvicorn.run(app, host="0.0.0.0", port=5100)
+''', executable=True)
+
+# ============================================================
+# 2. BB Core modules (with updates)
+# ============================================================
+write_file("bb/__init__.py", "\"\"\"BB Core package.\"\"\"\n")
+write_file("bb/core/__init__.py", "\"\"\"Core runtime and orchestration.\"\"\"\n")
+
+# --- models.py (unchanged) ---
+write_file("bb/core/models.py", '''
+\"\"\"Canonical BB data models.\"\"\"
+from dataclasses import dataclass, field
+from typing import List, Dict, Any, Optional
+from enum import Enum
+
+class MessageRole(Enum):
+    USER = "user"
+    ASSISTANT = "assistant"
+    TOOL = "tool"
+    SYSTEM = "system"
+
+@dataclass
+class AssistantToolCall:
+    id: str
+    name: str
+    arguments: Dict[str, Any]
+
+@dataclass
+class ToolResult:
+    tool_call_id: str
+    name: str
+    result: Any = None
+    error: Optional[str] = None
+
+@dataclass
+class Message:
+    role: MessageRole
+    content: Optional[str] = None
+    tool_calls: List[AssistantToolCall] = field(default_factory=list)
+    tool_call_id: Optional[str] = None
+    name: Optional[str] = None
+
+    def to_dict(self) -> dict:
+        return {
+            "role": self.role.value,
+            "content": self.content,
+            "tool_calls": [
+                {"id": tc.id, "name": tc.name, "arguments": tc.arguments}
+                for tc in self.tool_calls
+            ],
+            "tool_call_id": self.tool_call_id,
+            "name": self.name,
+        }
+
+@dataclass
+class Conversation:
+    messages: List[Message] = field(default_factory=list)
+
+    def add_user(self, content: str):
+        self.messages.append(Message(role=MessageRole.USER, content=content))
+
+    def add_assistant(self, content: str = None, tool_calls: List[AssistantToolCall] = None):
+        self.messages.append(Message(
+            role=MessageRole.ASSISTANT,
+            content=content,
+            tool_calls=tool_calls or []
+        ))
+
+    def add_tool_result(self, result: ToolResult):
+        self.messages.append(Message(
+            role=MessageRole.TOOL,
+            tool_call_id=result.tool_call_id,
+            name=result.name,
+            content=str(result.result) if result.result else (str(result.error) if result.error else None)
+        ))
+''')
+
+# --- event_bus.py (unchanged) ---
+write_file("bb/core/event_bus.py", '''
+\"\"\"Event bus for inter-component communication and SSE.\"\"\"
+import asyncio
+from datetime import datetime
+from typing import Dict, List, Callable, Any, Optional
+
+class EventBus:
+    def __init__(self):
+        self._subscribers: Dict[str, List[Callable]] = {}
+        self._sse_queues: Dict[str, asyncio.Queue] = {}
+
+    def subscribe(self, event_type: str, callback: Callable):
+        if event_type not in self._subscribers:
+            self._subscribers[event_type] = []
+        self._subscribers[event_type].append(callback)
+
+    async def emit(self, event_type: str, payload: Any, session_id: Optional[str] = None, broadcast: bool = False):
+        event = {
+            "type": event_type,
+            "timestamp": datetime.now().isoformat(),
+            "data": payload,
+            "session_id": session_id,
+        }
+        for cb in self._subscribers.get(event_type, []):
+            await cb(event)
+        if broadcast:
+            for queue in self._sse_queues.values():
+                await queue.put(event)
+        elif session_id and session_id in self._sse_queues:
+            await self._sse_queues[session_id].put(event)
+
+    def create_sse_queue(self, session_id: str) -> asyncio.Queue:
+        if session_id in self._sse_queues:
+            raise RuntimeError(f"Queue already exists for session {session_id}")
+        queue = asyncio.Queue()
+        self._sse_queues[session_id] = queue
+        return queue
+
+    def remove_sse_queue(self, session_id: str):
+        if session_id in self._sse_queues:
+            del self._sse_queues[session_id]
+''')
+
+# --- session.py (unchanged) ---
+write_file("bb/core/session.py", '''
+\"\"\"Session management.\"\"\"
+from typing import List, Dict, Any, Optional
+from .models import Message
+
+class Session:
+    def __init__(self, session_id: str, agent_id: str):
+        self.id = session_id
+        self.agent_id = agent_id
+        self.messages: List[Message] = []
+
+    def add_message(self, message: Message):
+        self.messages.append(message)
+
+class SessionManager:
+    def __init__(self):
+        self._sessions: Dict[str, Session] = {}
+
+    def get(self, session_id: str) -> Optional[Session]:
+        return self._sessions.get(session_id)
+
+    def create(self, agent_id: str, session_id: Optional[str] = None) -> Session:
+        if session_id is None:
+            import uuid
+            session_id = str(uuid.uuid4())
+        if session_id in self._sessions:
+            return self._sessions[session_id]
+        session = Session(session_id, agent_id)
+        self._sessions[session_id] = session
+        return session
+''')
+
+# --- agent.py (unchanged) ---
+write_file("bb/core/agent.py", '''
+\"\"\"Agent definitions and workspace.\"\"\"
+from pathlib import Path
+from dataclasses import dataclass, field
+from typing import List, Dict, Any
+import json
+
+@dataclass
+class AgentWorkspace:
+    agent_id: str
+    base_path: Path
+
+    def __post_init__(self):
+        self.root = self.base_path / self.agent_id
+        self.browser_profile = self.root / "browser"
+        self.cookies = self.root / "cookies.json"
+        self.files = self.root / "files"
+        self.state = self.root / "state.json"
+        self.ensure()
+
+    def ensure(self):
+        self.root.mkdir(parents=True, exist_ok=True)
+        self.browser_profile.mkdir(exist_ok=True)
+        self.files.mkdir(exist_ok=True)
+        if not self.cookies.exists():
+            self.cookies.write_text("{}")
+        if not self.state.exists():
+            self.state.write_text("{}")
+
+@dataclass
+class Agent:
+    id: str
+    name: str
+    provider: str
+    model: str
+    system_prompt: str
+    workspace: AgentWorkspace
+    permitted_tools: List[str] = field(default_factory=list)
+    permissions: Dict[str, str] = field(default_factory=dict)
+''')
+
+# --- credentials.py (unchanged) ---
+write_file("bb/core/credentials.py", '''
+\"\"\"Credentials manager – uses iOS Keychain.\"\"\"
+from typing import Optional
+from ..ios.keychain import KeychainManager
+
+class CredentialManager:
+    @staticmethod
+    def set_key(provider: str, key: str):
+        KeychainManager.set_key(provider, key)
+
+    @staticmethod
+    def get_key(provider: str) -> Optional[str]:
+        return KeychainManager.get_key(provider)
+
+    @staticmethod
+    def has_key(provider: str) -> bool:
+        return KeychainManager.get_key(provider) is not None
+''')
+
+# --- context_builder.py (unchanged) ---
+write_file("bb/core/context_builder.py", '''
+\"\"\"Context builder – assembles system prompt and relevant memory.\"\"\"
+from typing import Dict, Any, List, Optional
+from .session import Session
+from .agent import Agent
+from ..weaver.adapter import WeaverAdapter
+
+class ContextBuilder:
+    def __init__(self, weaver: WeaverAdapter):
+        self.weaver = weaver
+
+    async def build(self, user_input: str, session: Session, agent: Agent) -> Dict[str, Any]:
+        context = {
+            "orientation": "",
+            "hot": "",
+            "memories": [],
+            "task": user_input,
+            "conversation": session.messages[-10:] if session.messages else [],
+            "available_tools": agent.permitted_tools
+        }
+        try:
+            context["hot"] = await self.weaver.hot()
+        except Exception:
+            context["hot"] = "No HOT set."
+        try:
+            context["orientation"] = await self.weaver.orient()
+        except Exception:
+            context["orientation"] = "No ORIENT set."
+        try:
+            context["memories"] = await self.weaver.retrieve(user_input, budget=3)
+        except Exception:
+            context["memories"] = []
+        return context
+
+    def build_system_prompt(self, agent: Agent, context: Dict[str, Any]) -> str:
+        orientation = context.get("orientation", "")
+        hot = context.get("hot", "")
+        memories = context.get("memories", [])
+        available_tools = context.get("available_tools", [])
+        tools_description = "\\n".join([f"- {tool}" for tool in available_tools]) if available_tools else "No tools available."
+        return f'''You are {agent.name}, a personal AI assistant operating inside BlackBox (BB).
+
+## BB Environment
+
+You are not just a chat model. You are a coworker with access to a governed tool system.
+
+### Context Weaver Orientation
+{orientation}
+
+### Current Hot Context
+{hot}
+
+### Relevant Memories
+{chr(10).join([f"- {m}" for m in memories]) if memories else "No relevant memories retrieved."}
+
+### Your Available Tools
+{tools_description}
+
+## Your Role
+{agent.system_prompt}
+
+## Important Rules
+1. You can request tool calls when you need information or want to take action.
+2. All tool calls go through the BB Tool Gateway, which enforces policy and audit.
+3. You cannot access the filesystem directly. You must use the BB tools.
+4. Your workspace is isolated from other agents.
+5. The vault is the persistent cognitive substrate.
+
+## Response Style
+Be concise, thoughtful, and helpful. Use tools when appropriate.
+'''
+''')
+
+# --- provider_router.py (UPDATED with custom providers) ---
+write_file("bb/core/provider_router.py", '''
+\"\"\"Routes to the correct LLM provider – supports built‑in and custom.\"\"\"
+import json
+from pathlib import Path
+from typing import Optional, Dict
+from ..providers.base import LLMProvider
+from ..providers.claude import ClaudeAdapter
+from ..providers.openai import OpenAIAdapter
+from ..providers.generic_openai import GenericOpenAIAdapter
+from .credentials import CredentialManager
+
+class ProviderRouter:
+    def __init__(self, creds: CredentialManager, custom_providers_path: Path):
+        self.creds = creds
+        self.custom_providers_path = custom_providers_path
+        self._adapters = {}
+        self._custom_provider_configs = self._load_custom_providers()
+
+    def _load_custom_providers(self) -> Dict[str, Dict]:
+        if self.custom_providers_path.exists():
+            with open(self.custom_providers_path) as f:
+                return json.load(f)
+        return {}
+
+    def _save_custom_providers(self):
+        self.custom_providers_path.parent.mkdir(parents=True, exist_ok=True)
+        with open(self.custom_providers_path, "w") as f:
+            json.dump(self._custom_provider_configs, f, indent=2)
+
+    def add_custom_provider(self, name: str, base_url: str, api_key: str, model: str):
+        self._custom_provider_configs[name] = {
+            "base_url": base_url,
+            "api_key": api_key,
+            "model": model
+        }
+        self._save_custom_providers()
+        if name in self._adapters:
+            del self._adapters[name]
+
+    def delete_custom_provider(self, name: str):
+        if name in self._custom_provider_configs:
+            del self._custom_provider_configs[name]
+            self._save_custom_providers()
+            if name in self._adapters:
+                del self._adapters[name]
+
+    def get_provider(self, provider_name: str, model: Optional[str] = None) -> LLMProvider:
+        if provider_name in self._custom_provider_configs:
+            if provider_name not in self._adapters:
+                config = self._custom_provider_configs[provider_name]
+                api_key = config.get("api_key", "")
+                base_url = config["base_url"]
+                default_model = config.get("model", "default")
+                self._adapters[provider_name] = GenericOpenAIAdapter(
+                    api_key=api_key,
+                    base_url=base_url,
+                    default_model=default_model
+                )
+            return self._adapters[provider_name]
+
+        # Built-in providers
+        if provider_name not in self._adapters:
+            api_key = self.creds.get_key(provider_name)
+            if not api_key:
+                raise ValueError(f"No API key for provider: {provider_name}")
+            if provider_name == "claude":
+                self._adapters[provider_name] = ClaudeAdapter(api_key)
+            elif provider_name == "openai":
+                self._adapters[provider_name] = OpenAIAdapter(api_key)
+            elif provider_name == "gemini":
+                raise ValueError("Gemini adapter not yet implemented")
+            else:
+                raise ValueError(f"Unknown provider: {provider_name}")
+        return self._adapters[provider_name]
+
+    def list_providers(self) -> list:
+        built_in = ["claude", "openai", "gemini"]
+        custom = list(self._custom_provider_configs.keys())
+        return built_in + custom
+
+    def get_custom_providers(self) -> Dict:
+        return self._custom_provider_configs
+''')
+
+# --- runtime.py (UPDATED to pass custom providers path) ---
+write_file("bb/core/runtime.py", '''
+\"\"\"BB Runtime – orchestrates the entire agent loop.\"\"\"
+import asyncio
+import json
+from typing import Optional, Dict, Any, AsyncIterator
+from pathlib import Path
+
+from .event_bus import EventBus
+from .session import SessionManager
+from .agent import Agent, AgentWorkspace
+from .provider_router import ProviderRouter
+from .context_builder import ContextBuilder
+from .credentials import CredentialManager
+from .models import Conversation, AssistantToolCall, ToolResult, Message, MessageRole
+from ..gateway.tool_gateway import ToolGateway, ToolDefinition
+from ..gateway.policy import PolicyEngine
+from ..gateway.audit import AuditLogger
+from ..weaver.adapter import WeaverAdapter
+from ..providers.base import ProviderRequest, ProviderEvent
+
+class BBRuntime:
+    def __init__(self, data_path: Path, vault_path: Path):
+        self.data_path = data_path
+        self.vault_path = vault_path
+
+        self.events = EventBus()
+        self.creds = CredentialManager()
+        self.policy = PolicyEngine()
+        self.audit = AuditLogger(data_path)
+        self.gateway = ToolGateway(self.policy, self.audit)
+        self.gateway.set_human_override_check(self.is_human_override)
+        self.sessions = SessionManager()
+        self.agents = {}
+        self.custom_providers_path = data_path / "custom_providers.json"
+        self.router = ProviderRouter(self.creds, self.custom_providers_path)
+        self.weaver = WeaverAdapter(vault_path) if vault_path.exists() else None
+        self.context_builder = ContextBuilder(self.weaver) if self.weaver else None
+
+        self._human_override = False
+        self._running = False
+
+    async def start(self):
+        self._running = True
+        self._register_core_tools()
+        self._load_agents()
+        if self.weaver:
+            await self.weaver.index()
+
+    async def stop(self):
+        self._running = False
+        self.gateway.cancel_all_pending()
+
+    def _register_core_tools(self):
+        if self.weaver:
+            async def weaver_retrieve(args):
+                query = args.get("query", "")
+                limit = args.get("limit", 3)
+                results = await self.weaver.retrieve(query, limit)
+                return "\\n\\n".join(results)
+
+            async def weaver_hot(args):
+                return await self.weaver.hot()
+
+            async def weaver_orient(args):
+                return await self.weaver.orient()
+
+            async def weaver_capture(args):
+                content = args.get("content", "")
+                dest = args.get("dest", "06-Inbox")
+                path = await self.weaver.capture(content, dest)
+                return f"Captured to: {path}"
+
+            async def weaver_update(args):
+                note = args.get("note", "")
+                content = args.get("content", "")
+                path = await self.weaver.update(note, content)
+                return f"Updated: {path}"
+
+            async def weaver_link(args):
+                source = args.get("source", "")
+                target = args.get("target", "")
+                msg = await self.weaver.link(source, target)
+                return msg
+
+            async def weaver_search(args):
+                query = args.get("query", "")
+                results = await self.weaver.search(query)
+                return json.dumps(results, indent=2)
+
+            self.gateway.register_tool(ToolDefinition(
+                name="weaver.retrieve", risk="safe", requires_approval=False,
+                description="Retrieve relevant notes from the vault",
+                parameters={"type":"object","properties":{"query":{"type":"string"},"limit":{"type":"integer","default":3}}},
+                handler=weaver_retrieve
+            ))
+            self.gateway.register_tool(ToolDefinition(
+                name="weaver.hot", risk="safe", requires_approval=False,
+                description="Read the current HOT.md",
+                parameters={"type":"object","properties":{}},
+                handler=weaver_hot
+            ))
+            self.gateway.register_tool(ToolDefinition(
+                name="weaver.orient", risk="safe", requires_approval=False,
+                description="Read ORIENT.md",
+                parameters={"type":"object","properties":{}},
+                handler=weaver_orient
+            ))
+            self.gateway.register_tool(ToolDefinition(
+                name="weaver.capture", risk="observable", requires_approval=False,
+                description="Capture new content into the vault",
+                parameters={"type":"object","properties":{"content":{"type":"string"},"dest":{"type":"string","default":"06-Inbox"}}},
+                handler=weaver_capture
+            ))
+            self.gateway.register_tool(ToolDefinition(
+                name="weaver.update", risk="observable", requires_approval=False,
+                description="Update an existing note",
+                parameters={"type":"object","properties":{"note":{"type":"string"},"content":{"type":"string"}}},
+                handler=weaver_update
+            ))
+            self.gateway.register_tool(ToolDefinition(
+                name="weaver.link", risk="observable", requires_approval=False,
+                description="Add a wikilink from source to target",
+                parameters={"type":"object","properties":{"source":{"type":"string"},"target":{"type":"string"}}},
+                handler=weaver_link
+            ))
+            self.gateway.register_tool(ToolDefinition(
+                name="weaver.search", risk="safe", requires_approval=False,
+                description="Raw search returning full results",
+                parameters={"type":"object","properties":{"query":{"type":"string"}}},
+                handler=weaver_search
+            ))
+
+        async def shortcut_run(args):
+            name = args.get("name", "")
+            params = args.get("params", {})
+            from ..ios.shortcuts import ShortcutsBridge
+            return await ShortcutsBridge.run_shortcut(name, params)
+        self.gateway.register_tool(ToolDefinition(
+            name="shortcut.run", risk="sensitive", requires_approval=True,
+            description="Run an iOS Shortcut",
+            parameters={"type":"object","properties":{"name":{"type":"string"},"params":{"type":"object"}}},
+            handler=shortcut_run
+        ))
+
+        async def notify_send(args):
+            title = args.get("title", "BB")
+            body = args.get("body", "")
+            from ..ios.notifications import NotificationsBridge
+            return await NotificationsBridge.send_notification(title, body)
+        self.gateway.register_tool(ToolDefinition(
+            name="notification.send", risk="observable", requires_approval=False,
+            description="Send an immediate local notification",
+            parameters={"type":"object","properties":{"title":{"type":"string","default":"BB"},"body":{"type":"string"}}},
+            handler=notify_send
+        ))
+        async def notify_schedule(args):
+            title = args.get("title", "BB")
+            body = args.get("body", "")
+            delay = args.get("delay_seconds", 60)
+            from ..ios.notifications import NotificationsBridge
+            return await NotificationsBridge.schedule_notification(title, body, delay)
+        self.gateway.register_tool(ToolDefinition(
+            name="notification.schedule", risk="observable", requires_approval=False,
+            description="Schedule a notification after a delay (placeholder)",
+            parameters={"type":"object","properties":{"title":{"type":"string","default":"BB"},"body":{"type":"string"},"delay_seconds":{"type":"integer","default":60}}},
+            handler=notify_schedule
+        ))
+
+    def _load_agents(self):
+        from .agent import Agent, AgentWorkspace
+        workspace = AgentWorkspace("fable", self.data_path / "agents")
+        fable = Agent(
+            id="fable",
+            name="Fable",
+            provider="claude",
+            model="claude-3-5-sonnet-20241022",
+            system_prompt="You are Fable, a thoughtful and capable personal AI assistant. You help the user organize knowledge, make decisions, and automate tasks.",
+            workspace=workspace,
+            permitted_tools=[
+                "weaver.retrieve", "weaver.hot", "weaver.orient",
+                "weaver.capture", "weaver.update", "weaver.link",
+                "weaver.search", "shortcut.run",
+                "notification.send", "notification.schedule"
+            ],
+            permissions={
+                "weaver.retrieve": "auto",
+                "weaver.hot": "auto",
+                "weaver.orient": "auto",
+                "weaver.capture": "auto",
+                "weaver.update": "auto",
+                "weaver.link": "auto",
+                "weaver.search": "auto",
+                "shortcut.run": "approval",
+                "notification.send": "auto",
+                "notification.schedule": "auto",
+            }
+        )
+        self.agents["fable"] = fable
+
+    def get_agent(self, agent_id: str) -> Optional[Agent]:
+        return self.agents.get(agent_id)
+
+    def get_tool_names(self) -> list:
+        return self.gateway.get_tool_names()
+
+    def get_tool_definitions(self) -> list:
+        return self.gateway.get_tool_definitions()
+
+    def is_human_override(self) -> bool:
+        return self._human_override
+
+    async def set_human_override(self, enabled: bool):
+        self._human_override = enabled
+        if enabled:
+            self.gateway.cancel_all_pending()
+            await self.events.emit("human.took_wheel", {"enabled": True}, broadcast=True)
+        else:
+            await self.events.emit("human.released_wheel", {"enabled": False}, broadcast=True)
+
+    async def process(self, user_input: str, session_id: str, agent_id: str = "fable") -> AsyncIterator[ProviderEvent]:
+        agent = self.get_agent(agent_id)
+        if not agent:
+            yield ProviderEvent(type="error", error=f"Agent '{agent_id}' not found")
+            return
+
+        session = self.sessions.get(session_id)
+        if not session:
+            session = self.sessions.create(agent_id, session_id)
+
+        context_data = await self.context_builder.build(user_input, session, agent) if self.context_builder else {}
+        system_prompt = self.context_builder.build_system_prompt(agent, context_data) if self.context_builder else agent.system_prompt
+
+        conversation = Conversation()
+        for msg in session.messages[-10:]:
+            conversation.messages.append(msg)
+        conversation.add_user(user_input)
+
+        try:
+            provider = self.router.get_provider(agent.provider, agent.model)
+        except ValueError as e:
+            yield ProviderEvent(type="error", error=str(e))
+            return
+
+        tool_defs = self.gateway.get_tool_definitions()
+        permitted = set(agent.permitted_tools)
+        filtered_tools = [t for t in tool_defs if t["name"] in permitted]
+
+        max_iterations = 10
+        iteration = 0
+
+        while iteration < max_iterations:
+            iteration += 1
+            request = ProviderRequest(
+                system=system_prompt,
+                conversation=conversation.messages,
+                tools=filtered_tools,
+                model=agent.model or provider.get_model_name(),
+                temperature=0.7,
+                max_tokens=4096,
+            )
+
+            assistant_text = ""
+            assistant_tool_calls = []
+            tool_calls_in_round = []
+
+            async for event in provider.stream(request):
+                if event.type == "text":
+                    assistant_text += event.text
+                    yield ProviderEvent(type="text", text=event.text)
+
+                elif event.type == "tool_call":
+                    assistant_tool_calls.append(event.tool_call)
+                    tool_calls_in_round.append(event.tool_call)
+
+                elif event.type == "done":
+                    if assistant_text or assistant_tool_calls:
+                        conversation.add_assistant(
+                            content=assistant_text or None,
+                            tool_calls=assistant_tool_calls
+                        )
+
+                    if not tool_calls_in_round:
+                        yield ProviderEvent(type="done")
+                        return
+
+                    for tc in tool_calls_in_round:
+                        try:
+                            context = {
+                                "available_tools": self.get_tool_names(),
+                                "human_override": self.is_human_override()
+                            }
+                            result = await self.gateway.execute(
+                                agent=agent.__dict__,
+                                tool_name=tc.name,
+                                args=tc.arguments,
+                                context=context
+                            )
+                            conversation.add_tool_result(ToolResult(
+                                tool_call_id=tc.id,
+                                name=tc.name,
+                                result=result
+                            ))
+                            yield ProviderEvent(type="tool_result", tool_result=ToolResult(
+                                tool_call_id=tc.id,
+                                name=tc.name,
+                                result=result
+                            ))
+                        except Exception as e:
+                            conversation.add_tool_result(ToolResult(
+                                tool_call_id=tc.id,
+                                name=tc.name,
+                                error=str(e)
+                            ))
+                            yield ProviderEvent(type="tool_result", tool_result=ToolResult(
+                                tool_call_id=tc.id,
+                                name=tc.name,
+                                error=str(e)
+                            ))
+                    break
+
+                elif event.type == "error":
+                    yield event
+                    return
+
+        if iteration >= max_iterations:
+            yield ProviderEvent(type="error", error="Max tool iterations reached")
+''')
+
+# ============================================================
+# 3. Gateway (unchanged)
+# ============================================================
+write_file("bb/gateway/__init__.py", "\"\"\"Tool Gateway, Policy, Audit.\"\"\"\n")
+write_file("bb/gateway/policy.py", '''
+\"\"\"Fail‑closed policy engine.\"\"\"
+from enum import Enum
+from typing import Dict, Any, List
+
+class Decision(Enum):
+    ALLOW = "allow"
+    DENY = "deny"
+    REQUIRE_APPROVAL = "approval"
+
+class PolicyEngine:
+    def __init__(self):
+        self._deny_rules: List[Dict] = []
+        self._allow_rules: List[Dict] = []
+
+    async def evaluate(self, agent: Dict, tool_name: str, args: Dict, context: Dict) -> Decision:
+        if tool_name not in context.get("available_tools", []):
+            return Decision.DENY
+        if context.get("human_override", False):
+            return Decision.DENY
+        agent_permission = agent.get("permissions", {}).get(tool_name)
+        if agent_permission == "deny":
+            return Decision.DENY
+        elif agent_permission == "approval":
+            return Decision.REQUIRE_APPROVAL
+        elif agent_permission == "auto":
+            return Decision.ALLOW
+        for rule in self._deny_rules:
+            if self._matches(rule, agent, tool_name, args, context):
+                return Decision.DENY
+        for rule in self._allow_rules:
+            if self._matches(rule, agent, tool_name, args, context):
+                return Decision.ALLOW
+        return Decision.DENY
+
+    def _matches(self, rule, agent, tool_name, args, context):
+        return False
+''')
+
+write_file("bb/gateway/audit.py", '''
+\"\"\"Audit logger with state machine.\"\"\"
+import json
+import uuid
+import sqlite3
+from pathlib import Path
+from datetime import datetime
+from typing import Any, Optional
+
+class AuditLogger:
+    def __init__(self, storage_path: Path):
+        self.db_path = storage_path / "audit.db"
+        self._init_db()
+
+    def _init_db(self):
+        conn = sqlite3.connect(self.db_path)
+        conn.execute('''
+            CREATE TABLE IF NOT EXISTS audit (
+                id TEXT PRIMARY KEY,
+                timestamp TEXT,
+                agent_id TEXT,
+                tool TEXT,
+                args TEXT,
+                decision TEXT,
+                status TEXT,
+                result TEXT,
+                error TEXT
+            )
+        ''')
+        conn.commit()
+        conn.close()
+
+    def record_decision(self, agent_id: str, tool: str, args: dict, decision: str, reason: str = "") -> str:
+        audit_id = str(uuid.uuid4())
+        conn = sqlite3.connect(self.db_path)
+        conn.execute(
+            "INSERT INTO audit (id, timestamp, agent_id, tool, args, decision, status) VALUES (?, ?, ?, ?, ?, ?, ?)",
+            (audit_id, datetime.now().isoformat(), agent_id, tool, json.dumps(args), decision, "DECIDED")
+        )
+        conn.commit()
+        conn.close()
+        return audit_id
+
+    def update_status(self, audit_id: str, status: str, result: Any = None, error: Optional[str] = None):
+        conn = sqlite3.connect(self.db_path)
+        conn.execute(
+            "UPDATE audit SET status = ?, result = ?, error = ? WHERE id = ?",
+            (status, json.dumps(result) if result is not None else None, error, audit_id)
+        )
+        conn.commit()
+        conn.close()
+
+    def get_recent(self, limit: int = 50) -> list:
+        conn = sqlite3.connect(self.db_path)
+        conn.row_factory = sqlite3.Row
+        cursor = conn.execute("SELECT * FROM audit ORDER BY timestamp DESC LIMIT ?", (limit,))
+        rows = cursor.fetchall()
+        conn.close()
+        return [dict(row) for row in rows]
+''')
+
+write_file("bb/gateway/tool_gateway.py", '''
+\"\"\"Single action boundary – the Gateway.\"\"\"
+import asyncio
+import uuid
+from typing import Dict, Any, Callable, Awaitable, Optional, List
+from dataclasses import dataclass, field
+from datetime import datetime
+from .policy import PolicyEngine, Decision
+from .audit import AuditLogger
+
+class HumanOverrideError(Exception):
+    pass
+
+class ToolDeniedError(Exception):
+    pass
+
+@dataclass
+class ToolDefinition:
+    name: str
+    description: str
+    parameters: dict
+    handler: Callable[[dict], Awaitable[Any]]
+    risk: str = "safe"
+    requires_approval: bool = False
+    destructive: bool = False
+    scopes: List[str] = field(default_factory=list)
+    capabilities: List[str] = field(default_factory=list)
+
+@dataclass
+class PendingApproval:
+    id: str
+    audit_id: str
+    agent_id: str
+    tool_name: str
+    args: dict
+    future: asyncio.Future
+    created_at: str = field(default_factory=lambda: datetime.now().isoformat())
+
+class ToolGateway:
+    def __init__(self, policy: PolicyEngine, audit: AuditLogger):
+        self.policy = policy
+        self.audit = audit
+        self._tools: Dict[str, ToolDefinition] = {}
+        self._pending_approvals: Dict[str, PendingApproval] = {}
+        self._human_override_check = None
+
+    def set_human_override_check(self, func):
+        self._human_override_check = func
+
+    def register_tool(self, definition: ToolDefinition):
+        self._tools[definition.name] = definition
+
+    def get_tool_names(self) -> List[str]:
+        return list(self._tools.keys())
+
+    def get_tool_definitions(self) -> list:
+        return [
+            {
+                "name": t.name,
+                "description": t.description,
+                "parameters": t.parameters,
+                "scopes": t.scopes,
+                "capabilities": t.capabilities,
+            }
+            for t in self._tools.values()
+        ]
+
+    async def execute(self, agent: dict, tool_name: str, args: dict, context: dict = None) -> Any:
+        context = context or {}
+        if self._human_override_check and self._human_override_check():
+            raise HumanOverrideError("Human has taken the wheel.")
+
+        tool = self._tools.get(tool_name)
+        if not tool:
+            audit_id = self.audit.record_decision(agent.get("id","unknown"), tool_name, args, "DENY", "Unknown tool")
+            self.audit.update_status(audit_id, "DENIED", error="Unknown tool")
+            raise ValueError(f"Unknown tool: {tool_name}")
+
+        decision = await self.policy.evaluate(agent, tool_name, args, context)
+
+        if decision == Decision.DENY:
+            audit_id = self.audit.record_decision(agent.get("id","unknown"), tool_name, args, "DENY", "Policy denied")
+            self.audit.update_status(audit_id, "DENIED", error="Denied by policy")
+            raise ToolDeniedError(f"Tool '{tool_name}' denied by policy")
+
+        if decision == Decision.REQUIRE_APPROVAL or (tool.requires_approval and agent.get("permissions",{}).get(tool_name) != "deny"):
+            audit_id = self.audit.record_decision(agent.get("id","unknown"), tool_name, args, "APPROVAL_REQUIRED")
+            approval_id = await self._request_approval(agent, tool_name, args, audit_id)
+            try:
+                await self._wait_for_approval(approval_id)
+                self.audit.update_status(audit_id, "APPROVED")
+            except asyncio.CancelledError:
+                self.audit.update_status(audit_id, "DENIED", error="Approval cancelled")
+                raise
+            except Exception as e:
+                self.audit.update_status(audit_id, "DENIED", error=str(e))
+                raise
+        else:
+            audit_id = self.audit.record_decision(agent.get("id","unknown"), tool_name, args, "ALLOW")
+
+        self.audit.update_status(audit_id, "EXECUTING")
+        try:
+            result = await tool.handler(args)
+            self.audit.update_status(audit_id, "SUCCESS", result=result)
+            return result
+        except Exception as e:
+            self.audit.update_status(audit_id, "FAILED", error=str(e))
+            raise
+
+    async def _request_approval(self, agent: dict, tool_name: str, args: dict, audit_id: str) -> str:
+        approval_id = str(uuid.uuid4())
+        future = asyncio.Future()
+        self._pending_approvals[approval_id] = PendingApproval(
+            id=approval_id,
+            audit_id=audit_id,
+            agent_id=agent.get("id","unknown"),
+            tool_name=tool_name,
+            args=args,
+            future=future
+        )
+        return approval_id
+
+    async def _wait_for_approval(self, approval_id: str):
+        pending = self._pending_approvals.get(approval_id)
+        if not pending:
+            raise ValueError(f"Unknown approval: {approval_id}")
+        await pending.future
+        del self._pending_approvals[approval_id]
+
+    def approve(self, approval_id: str):
+        pending = self._pending_approvals.get(approval_id)
+        if pending:
+            pending.future.set_result(True)
+
+    def deny_approval(self, approval_id: str):
+        pending = self._pending_approvals.get(approval_id)
+        if pending:
+            pending.future.set_exception(ToolDeniedError("User denied approval"))
+
+    def cancel_all_pending(self):
+        for approval_id, pending in list(self._pending_approvals.items()):
+            pending.future.cancel()
+            del self._pending_approvals[approval_id]
+''')
+
+# ============================================================
+# 4. Providers (with new generic_openai.py)
+# ============================================================
+write_file("bb/providers/__init__.py", "\"\"\"Provider adapters.\"\"\"\n")
+write_file("bb/providers/base.py", '''
+\"\"\"Abstract provider interface.\"\"\"
+from abc import ABC, abstractmethod
+from typing import AsyncIterator, List, Dict, Any, Optional
+from dataclasses import dataclass
+from ..core.models import AssistantToolCall, ToolResult, Message
+
+@dataclass
+class ProviderRequest:
+    system: str
+    conversation: List[Message]
+    tools: List[Dict[str, Any]]
+    model: str
+    temperature: float = 0.7
+    max_tokens: int = 4096
+
+@dataclass
+class ProviderEvent:
+    type: str  # "text", "tool_call", "tool_result", "error", "done"
+    text: Optional[str] = None
+    tool_call: Optional[AssistantToolCall] = None
+    tool_result: Optional[ToolResult] = None
+    error: Optional[str] = None
+
+class LLMProvider(ABC):
+    @abstractmethod
+    async def stream(self, request: ProviderRequest) -> AsyncIterator[ProviderEvent]:
+        pass
+    @abstractmethod
+    def get_model_name(self) -> str:
+        pass
+    @abstractmethod
+    def get_context_limit(self) -> int:
+        pass
+''')
+
+write_file("bb/providers/claude.py", '''
+\"\"\"Claude (Anthropic) adapter.\"\"\"
+import json
+import httpx
+from typing import AsyncIterator, Dict, Any, List, Optional
+from .base import LLMProvider, ProviderRequest, ProviderEvent
+from ..core.models import AssistantToolCall, Message, MessageRole
+
+class ClaudeAdapter(LLMProvider):
+    def __init__(self, api_key: str, default_model: str = "claude-3-5-sonnet-20241022"):
+        self.api_key = api_key
+        self._default_model = default_model
+
+    def get_model_name(self) -> str:
+        return self._default_model
+
+    def get_context_limit(self) -> int:
+        return 200000
+
+    def _translate_tools(self, bb_tools: List[Dict]) -> List[Dict]:
+        return [{
+            "name": t["name"],
+            "description": t.get("description", ""),
+            "input_schema": t.get("parameters", {"type": "object", "properties": {}})
+        } for t in bb_tools]
+
+    def _translate_messages(self, messages: List[Message]) -> List[Dict]:
+        translated = []
+        for msg in messages:
+            if msg.role == MessageRole.SYSTEM:
+                continue
+            elif msg.role == MessageRole.USER:
+                translated.append({"role": "user", "content": msg.content})
+            elif msg.role == MessageRole.ASSISTANT:
+                if msg.tool_calls:
+                    blocks = []
+                    if msg.content:
+                        blocks.append({"type": "text", "text": msg.content})
+                    for tc in msg.tool_calls:
+                        blocks.append({
+                            "type": "tool_use",
+                            "id": tc.id,
+                            "name": tc.name,
+                            "input": tc.arguments
+                        })
+                    translated.append({"role": "assistant", "content": blocks})
+                else:
+                    translated.append({"role": "assistant", "content": msg.content})
+            elif msg.role == MessageRole.TOOL:
+                translated.append({
+                    "role": "user",
+                    "content": [{
+                        "type": "tool_result",
+                        "tool_use_id": msg.tool_call_id,
+                        "content": msg.content or "Success"
+                    }]
+                })
+        return translated
+
+    async def stream(self, request: ProviderRequest) -> AsyncIterator[ProviderEvent]:
+        url = "https://api.anthropic.com/v1/messages"
+        model = request.model if request.model else self._default_model
+        payload = {
+            "model": model,
+            "system": request.system,
+            "messages": self._translate_messages(request.conversation),
+            "max_tokens": request.max_tokens,
+            "temperature": request.temperature,
+            "stream": True
+        }
+        tools = self._translate_tools(request.tools)
+        if tools:
+            payload["tools"] = tools
+
+        headers = {
+            "x-api-key": self.api_key,
+            "anthropic-version": "2023-06-01",
+            "content-type": "application/json"
+        }
+
+        async with httpx.AsyncClient(timeout=60.0) as client:
+            async with client.stream("POST", url, json=payload, headers=headers) as response:
+                if response.status_code != 200:
+                    error_text = await response.aread()
+                    yield ProviderEvent(type="error", error=f"Claude API error {response.status_code}: {error_text.decode()}")
+                    return
+
+                tool_blocks = {}
+                async for line in response.aiter_lines():
+                    if not line.startswith("data: "):
+                        continue
+                    data_str = line[6:].strip()
+                    if data_str == "[DONE]":
+                        continue
+                    try:
+                        data = json.loads(data_str)
+                    except:
+                        continue
+
+                    etype = data.get("type")
+                    if etype == "content_block_start":
+                        block = data.get("content_block", {})
+                        if block.get("type") == "tool_use":
+                            idx = data.get("index")
+                            tool_blocks[idx] = {
+                                "id": block.get("id",""),
+                                "name": block.get("name",""),
+                                "arguments": ""
+                            }
+                    elif etype == "content_block_delta":
+                        delta = data.get("delta", {})
+                        if delta.get("type") == "text_delta":
+                            yield ProviderEvent(type="text", text=delta.get("text",""))
+                        elif delta.get("type") == "input_json_delta":
+                            idx = data.get("index")
+                            if idx in tool_blocks:
+                                tool_blocks[idx]["arguments"] += delta.get("partial_json","")
+                    elif etype == "content_block_stop":
+                        idx = data.get("index")
+                        if idx in tool_blocks:
+                            block = tool_blocks.pop(idx)
+                            try:
+                                args = json.loads(block["arguments"]) if block["arguments"] else {}
+                            except:
+                                args = {}
+                            yield ProviderEvent(
+                                type="tool_call",
+                                tool_call=AssistantToolCall(
+                                    id=block["id"],
+                                    name=block["name"],
+                                    arguments=args
+                                )
+                            )
+                    elif etype == "message_stop":
+                        yield ProviderEvent(type="done")
+                    elif etype == "error":
+                        yield ProviderEvent(type="error", error=data.get("error",{}).get("message","Unknown error"))
+''')
+
+write_file("bb/providers/openai.py", '''
+\"\"\"OpenAI adapter.\"\"\"
+import json
+import httpx
+from typing import AsyncIterator, Dict, Any, List
+from .base import LLMProvider, ProviderRequest, ProviderEvent
+from ..core.models import AssistantToolCall, Message, MessageRole
+
+class OpenAIAdapter(LLMProvider):
+    def __init__(self, api_key: str, default_model: str = "gpt-4o"):
+        self.api_key = api_key
+        self._default_model = default_model
+
+    def get_model_name(self) -> str:
+        return self._default_model
+
+    def get_context_limit(self) -> int:
+        return 128000
+
+    def _translate_tools(self, bb_tools: List[Dict]) -> List[Dict]:
+        return [{
+            "type": "function",
+            "function": {
+                "name": t["name"],
+                "description": t.get("description", ""),
+                "parameters": t.get("parameters", {"type": "object", "properties": {}})
+            }
+        } for t in bb_tools]
+
+    def _translate_messages(self, messages: List[Message]) -> List[Dict]:
+        translated = []
+        for msg in messages:
+            if msg.role == MessageRole.SYSTEM:
+                translated.append({"role": "system", "content": msg.content})
+            elif msg.role == MessageRole.USER:
+                translated.append({"role": "user", "content": msg.content})
+            elif msg.role == MessageRole.ASSISTANT:
+                if msg.tool_calls:
+                    tool_calls = [{
+                        "id": tc.id,
+                        "type": "function",
+                        "function": {
+                            "name": tc.name,
+                            "arguments": json.dumps(tc.arguments)
+                        }
+                    } for tc in msg.tool_calls]
+                    translated.append({
+                        "role": "assistant",
+                        "content": msg.content or None,
+                        "tool_calls": tool_calls
+                    })
+                else:
+                    translated.append({"role": "assistant", "content": msg.content})
+            elif msg.role == MessageRole.TOOL:
+                translated.append({
+                    "role": "tool",
+                    "tool_call_id": msg.tool_call_id,
+                    "content": msg.content or "Success"
+                })
+        return translated
+
+    async def stream(self, request: ProviderRequest) -> AsyncIterator[ProviderEvent]:
+        url = "https://api.openai.com/v1/chat/completions"
+        model = request.model if request.model else self._default_model
+        payload = {
+            "model": model,
+            "messages": self._translate_messages(request.conversation),
+            "max_tokens": request.max_tokens,
+            "temperature": request.temperature,
+            "stream": True
+        }
+        tools = self._translate_tools(request.tools)
+        if tools:
+            payload["tools"] = tools
+            payload["tool_choice"] = "auto"
+
+        headers = {
+            "Authorization": f"Bearer {self.api_key}",
+            "Content-Type": "application/json"
+        }
+
+        async with httpx.AsyncClient(timeout=60.0) as client:
+            async with client.stream("POST", url, json=payload, headers=headers) as response:
+                if response.status_code != 200:
+                    error_text = await response.aread()
+                    yield ProviderEvent(type="error", error=f"OpenAI API error {response.status_code}: {error_text.decode()}")
+                    return
+
+                tool_calls_in_progress = {}
+                async for line in response.aiter_lines():
+                    if not line.startswith("data: "):
+                        continue
+                    data_str = line[6:].strip()
+                    if data_str == "[DONE]":
+                        continue
+                    try:
+                        data = json.loads(data_str)
+                    except:
+                        continue
+
+                    if "choices" not in data:
+                        continue
+
+                    choice = data["choices"][0]
+                    delta = choice.get("delta", {})
+
+                    if "content" in delta and delta["content"]:
+                        yield ProviderEvent(type="text", text=delta["content"])
+
+                    if "tool_calls" in delta:
+                        for tc in delta["tool_calls"]:
+                            idx = tc.get("index", 0)
+                            if idx not in tool_calls_in_progress:
+                                tool_calls_in_progress[idx] = {
+                                    "id": tc.get("id", ""),
+                                    "name": tc.get("function", {}).get("name", ""),
+                                    "arguments": ""
+                                }
+                            if "function" in tc and "arguments" in tc["function"]:
+                                tool_calls_in_progress[idx]["arguments"] += tc["function"]["arguments"]
+
+                    finish_reason = choice.get("finish_reason")
+                    if finish_reason == "tool_calls":
+                        for idx, call in list(tool_calls_in_progress.items()):
+                            try:
+                                args = json.loads(call["arguments"]) if call["arguments"] else {}
+                            except:
+                                args = {}
+                            yield ProviderEvent(
+                                type="tool_call",
+                                tool_call=AssistantToolCall(
+                                    id=call["id"],
+                                    name=call["name"],
+                                    arguments=args
+                                )
+                            )
+                        tool_calls_in_progress.clear()
+                    elif finish_reason == "stop":
+                        yield ProviderEvent(type="done")
+''')
+
+# ---- NEW: generic_openai.py ----
+write_file("bb/providers/generic_openai.py", '''
+\"\"\"Generic OpenAI-compatible adapter for custom providers.\"\"\"
+import json
+import httpx
+from typing import AsyncIterator, Dict, Any, List
+from .base import LLMProvider, ProviderRequest, ProviderEvent
+from ..core.models import AssistantToolCall, Message, MessageRole
+
+class GenericOpenAIAdapter(LLMProvider):
+    def __init__(self, api_key: str, base_url: str, default_model: str):
+        self.api_key = api_key
+        self.base_url = base_url.rstrip('/')
+        self._default_model = default_model
+
+    def get_model_name(self) -> str:
+        return self._default_model
+
+    def get_context_limit(self) -> int:
+        return 128000
+
+    def _translate_tools(self, bb_tools: List[Dict]) -> List[Dict]:
+        return [{
+            "type": "function",
+            "function": {
+                "name": t["name"],
+                "description": t.get("description", ""),
+                "parameters": t.get("parameters", {"type": "object", "properties": {}})
+            }
+        } for t in bb_tools]
+
+    def _translate_messages(self, messages: List[Message]) -> List[Dict]:
+        translated = []
+        for msg in messages:
+            if msg.role == MessageRole.SYSTEM:
+                translated.append({"role": "system", "content": msg.content})
+            elif msg.role == MessageRole.USER:
+                translated.append({"role": "user", "content": msg.content})
+            elif msg.role == MessageRole.ASSISTANT:
+                if msg.tool_calls:
+                    tool_calls = [{
+                        "id": tc.id,
+                        "type": "function",
+                        "function": {
+                            "name": tc.name,
+                            "arguments": json.dumps(tc.arguments)
+                        }
+                    } for tc in msg.tool_calls]
+                    translated.append({
+                        "role": "assistant",
+                        "content": msg.content or None,
+                        "tool_calls": tool_calls
+                    })
+                else:
+                    translated.append({"role": "assistant", "content": msg.content})
+            elif msg.role == MessageRole.TOOL:
+                translated.append({
+                    "role": "tool",
+                    "tool_call_id": msg.tool_call_id,
+                    "content": msg.content or "Success"
+                })
+        return translated
+
+    async def stream(self, request: ProviderRequest) -> AsyncIterator[ProviderEvent]:
+        url = f"{self.base_url}/chat/completions"
+        model = request.model if request.model else self._default_model
+        payload = {
+            "model": model,
+            "messages": self._translate_messages(request.conversation),
+            "max_tokens": request.max_tokens,
+            "temperature": request.temperature,
+            "stream": True
+        }
+        tools = self._translate_tools(request.tools)
+        if tools:
+            payload["tools"] = tools
+            payload["tool_choice"] = "auto"
+
+        headers = {
+            "Authorization": f"Bearer {self.api_key}",
+            "Content-Type": "application/json"
+        }
+
+        async with httpx.AsyncClient(timeout=60.0) as client:
+            async with client.stream("POST", url, json=payload, headers=headers) as response:
+                if response.status_code != 200:
+                    error_text = await response.aread()
+                    yield ProviderEvent(type="error", error=f"Custom provider error {response.status_code}: {error_text.decode()}")
+                    return
+
+                tool_calls_in_progress = {}
+                current_text = ""
+                async for line in response.aiter_lines():
+                    if not line.startswith("data: "):
+                        continue
+                    data_str = line[6:].strip()
+                    if data_str == "[DONE]":
+                        continue
+                    try:
+                        data = json.loads(data_str)
+                    except:
+                        continue
+
+                    if "choices" not in data:
+                        continue
+
+                    choice = data["choices"][0]
+                    delta = choice.get("delta", {})
+
+                    if "content" in delta and delta["content"]:
+                        current_text += delta["content"]
+                        yield ProviderEvent(type="text", text=delta["content"])
+
+                    if "tool_calls" in delta:
+                        for tc in delta["tool_calls"]:
+                            idx = tc.get("index", 0)
+                            if idx not in tool_calls_in_progress:
+                                tool_calls_in_progress[idx] = {
+                                    "id": tc.get("id", ""),
+                                    "name": tc.get("function", {}).get("name", ""),
+                                    "arguments": ""
+                                }
+                            if "function" in tc and "arguments" in tc["function"]:
+                                tool_calls_in_progress[idx]["arguments"] += tc["function"]["arguments"]
+
+                    finish_reason = choice.get("finish_reason")
+                    if finish_reason == "tool_calls":
+                        for idx, call in list(tool_calls_in_progress.items()):
+                            try:
+                                args = json.loads(call["arguments"]) if call["arguments"] else {}
+                            except:
+                                args = {}
+                            yield ProviderEvent(
+                                type="tool_call",
+                                tool_call=AssistantToolCall(
+                                    id=call["id"],
+                                    name=call["name"],
+                                    arguments=args
+                                )
+                            )
+                        tool_calls_in_progress.clear()
+                    elif finish_reason == "stop":
+                        yield ProviderEvent(type="done")
+''')
+
+# ============================================================
+# 5. Weaver (unchanged)
+# ============================================================
+write_file("bb/weaver/__init__.py", "\"\"\"Weaver – Obsidian integration.\"\"\"\n")
+write_file("bb/weaver/adapter.py", '''
+\"\"\"WeaverAdapter – semantic interface to the vault.\"\"\"
+from pathlib import Path
+from typing import List, Optional
+from datetime import datetime
+from .parser import MarkdownParser
+from .index import FTSIndex
+from .vault import Vault
+
+class WeaverAdapter:
+    def __init__(self, vault_path: Path):
+        self.vault_path = vault_path
+        self.parser = MarkdownParser()
+        self.index = FTSIndex(vault_path / ".bb_index.db")
+        self.vault = Vault(vault_path)
+
+    async def retrieve(self, query: str, limit: int = 5) -> List[str]:
+        results = self.index.search(query, limit)
+        return [r["snippet"] for r in results]
+
+    async def hot(self) -> str:
+        hot_path = self.vault_path / "_agent/context/HOT.md"
+        if hot_path.exists():
+            return hot_path.read_text(encoding="utf-8")
+        return "No HOT.md found."
+
+    async def orient(self) -> str:
+        orient_path = self.vault_path / "ORIENT.md"
+        if orient_path.exists():
+            return orient_path.read_text(encoding="utf-8")
+        return "No ORIENT.md found."
+
+    async def capture(self, content: str, destination: str = "06-Inbox") -> str:
+        ts = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
+        filename = f"{ts}.md"
+        dest_path = self.vault_path / destination
+        dest_path.mkdir(parents=True, exist_ok=True)
+        file_path = dest_path / filename
+        file_path.write_text(content, encoding="utf-8")
+        parsed = self.parser.parse(content)
+        self.index.index_file(file_path, parsed)
+        return str(file_path)
+
+    async def update(self, note_path: str, content: str) -> str:
+        path = self.vault_path / note_path
+        if not path.exists():
+            raise ValueError(f"Note {note_path} does not exist")
+        path.write_text(content, encoding="utf-8")
+        parsed = self.parser.parse(content)
+        self.index.index_file(path, parsed)
+        return str(path)
+
+    async def link(self, source: str, target: str) -> str:
+        source_path = self.vault_path / source
+        if not source_path.exists():
+            raise ValueError(f"Source note {source} does not exist")
+        content = source_path.read_text(encoding="utf-8")
+        if f"[[{target}]]" in content:
+            return f"Link already exists from {source} to {target}"
+        new_content = content.rstrip() + f"\\n\\n[[{target}]]"
+        source_path.write_text(new_content, encoding="utf-8")
+        parsed = self.parser.parse(new_content)
+        self.index.index_file(source_path, parsed)
+        return f"Added link [[{target}]] to {source}"
+
+    async def distill(self, source: str) -> str:
+        return f"Distillation of {source} (not implemented)"
+
+    async def consolidate(self) -> str:
+        return "Consolidation triggered (not implemented)"
+
+    async def index(self):
+        self.index.reindex_all(self.vault_path, self.parser)
+
+    async def reindex(self):
+        self.index.reindex_all(self.vault_path, self.parser)
+
+    async def search(self, query: str) -> List[dict]:
+        return self.index.search(query)
+
+    async def read(self, note_path: str) -> str:
+        path = self.vault_path / note_path
+        if path.exists():
+            return path.read_text(encoding="utf-8")
+        raise FileNotFoundError(f"Note {note_path} not found")
+
+    async def list_directory(self, path: str = "") -> List[str]:
+        full_path = self.vault_path / path
+        if not full_path.exists():
+            return []
+        return [str(p.relative_to(self.vault_path)) for p in full_path.iterdir() if p.is_file()]
+''')
+
+write_file("bb/weaver/parser.py", '''
+\"\"\"Markdown parser – extracts frontmatter, headings, links, tags.\"\"\"
+import re
+import yaml
+from typing import Dict, List
+
+class MarkdownParser:
+    @staticmethod
+    def parse(content: str) -> Dict:
+        result = {
+            "frontmatter": {},
+            "title": "",
+            "headings": [],
+            "body": "",
+            "links": [],
+            "tags": [],
+            "raw": content
+        }
+        frontmatter_match = re.match(r'^---\\s*\\n(.*?)\\n---\\s*\\n', content, re.DOTALL)
+        if frontmatter_match:
+            frontmatter_text = frontmatter_match.group(1)
+            try:
+                result["frontmatter"] = yaml.safe_load(frontmatter_text) or {}
+            except:
+                pass
+            content = content[frontmatter_match.end():]
+        title_match = re.search(r'^# (.+)$', content, re.MULTILINE)
+        if title_match:
+            result["title"] = title_match.group(1).strip()
+        else:
+            first_line = content.split('\\n')[0].strip()
+            result["title"] = first_line if first_line else "Untitled"
+        heading_pattern = re.compile(r'^(#{1,6})\\s+(.+)$', re.MULTILINE)
+        result["headings"] = [
+            {"level": len(m.group(1)), "text": m.group(2).strip()}
+            for m in heading_pattern.finditer(content)
+        ]
+        link_pattern = re.compile(r'\\[\\[(.*?)\\]\\]')
+        result["links"] = [m.group(1) for m in link_pattern.finditer(content)]
+        if "tags" in result["frontmatter"]:
+            tags = result["frontmatter"]["tags"]
+            if isinstance(tags, str):
+                result["tags"] = [t.strip() for t in tags.split(',')]
+            elif isinstance(tags, list):
+                result["tags"] = tags
+        else:
+            inline_tags = re.findall(r'#(\\w+)', content)
+            result["tags"] = list(set(inline_tags))
+        result["body"] = content.strip()
+        return result
+
+    @staticmethod
+    def to_markdown(parsed: Dict) -> str:
+        lines = []
+        if parsed.get("frontmatter"):
+            lines.append("---")
+            lines.append(yaml.dump(parsed["frontmatter"], default_flow_style=False).strip())
+            lines.append("---")
+            lines.append("")
+        if parsed.get("title"):
+            lines.append(f"# {parsed['title']}")
+            lines.append("")
+        if parsed.get("body"):
+            lines.append(parsed["body"])
+        return "\\n".join(lines)
+''')
+
+write_file("bb/weaver/index.py", '''
+\"\"\"FTS5 index for the vault.\"\"\"
+import sqlite3
+import json
+from pathlib import Path
+from typing import List, Dict
+from datetime import datetime
+
+class FTSIndex:
+    def __init__(self, db_path: Path):
+        self.db_path = db_path
+        self._init_db()
+
+    def _init_db(self):
+        conn = sqlite3.connect(self.db_path)
+        conn.execute("CREATE VIRTUAL TABLE IF NOT EXISTS fts USING fts5(path, title, body, content, tags, metadata, tokenize='porter unicode61')")
+        conn.execute('''
+            CREATE TABLE IF NOT EXISTS documents (
+                path TEXT PRIMARY KEY,
+                modified TEXT,
+                title TEXT,
+                tags TEXT,
+                links TEXT,
+                indexed_at TEXT
+            )
+        ''')
+        conn.commit()
+        conn.close()
+
+    def index_file(self, path: Path, parsed: Dict):
+        conn = sqlite3.connect(self.db_path)
+        cursor = conn.cursor()
+        cursor.execute('''
+            INSERT OR REPLACE INTO fts (rowid, path, title, body, content, tags, metadata)
+            VALUES ((SELECT rowid FROM fts WHERE path = ?), ?, ?, ?, ?, ?, ?)
+        ''', (
+            str(path),
+            str(path),
+            parsed.get("title",""),
+            parsed.get("body",""),
+            parsed.get("raw",""),
+            ",".join(parsed.get("tags",[])),
+            json.dumps(parsed.get("frontmatter",{}))
+        ))
+        cursor.execute('''
+            INSERT OR REPLACE INTO documents (path, modified, title, tags, links, indexed_at)
+            VALUES (?, ?, ?, ?, ?, ?)
+        ''', (
+            str(path),
+            datetime.now().isoformat(),
+            parsed.get("title",""),
+            ",".join(parsed.get("tags",[])),
+            ",".join(parsed.get("links",[])),
+            datetime.now().isoformat()
+        ))
+        conn.commit()
+        conn.close()
+
+    def search(self, query: str, limit: int = 5) -> List[Dict]:
+        conn = sqlite3.connect(self.db_path)
+        conn.row_factory = sqlite3.Row
+        cursor = conn.cursor()
+        cursor.execute('''
+            SELECT
+                fts.path,
+                fts.title,
+                fts.body,
+                fts.tags,
+                fts.metadata,
+                documents.modified,
+                highlight(fts, 3, '[', ']') as snippet
+            FROM fts
+            JOIN documents ON documents.path = fts.path
+            WHERE fts MATCH ?
+            ORDER BY rank
+            LIMIT ?
+        ''', (query, limit))
+        rows = cursor.fetchall()
+        results = []
+        for row in rows:
+            results.append({
+                "path": row["path"],
+                "title": row["title"],
+                "body": row["body"],
+                "snippet": row["snippet"] if row["snippet"] else row["body"][:200],
+                "tags": row["tags"].split(",") if row["tags"] else [],
+                "metadata": json.loads(row["metadata"]) if row["metadata"] else {},
+                "modified": row["modified"]
+            })
+        conn.close()
+        return results
+
+    def delete_file(self, path: Path):
+        conn = sqlite3.connect(self.db_path)
+        conn.execute("DELETE FROM fts WHERE path = ?", (str(path),))
+        conn.execute("DELETE FROM documents WHERE path = ?", (str(path),))
+        conn.commit()
+        conn.close()
+
+    def reindex_all(self, vault_path: Path, parser):
+        conn = sqlite3.connect(self.db_path)
+        conn.execute("DELETE FROM fts")
+        conn.execute("DELETE FROM documents")
+        conn.commit()
+        conn.close()
+        for md_file in vault_path.rglob("*.md"):
+            try:
+                content = md_file.read_text(encoding="utf-8")
+                parsed = parser.parse(content)
+                self.index_file(md_file, parsed)
+            except Exception as e:
+                print(f"Error indexing {md_file}: {e}")
+''')
+
+write_file("bb/weaver/vault.py", '''
+\"\"\"Vault – file system operations.\"\"\"
+from pathlib import Path
+from typing import List
+
+class Vault:
+    def __init__(self, root: Path):
+        self.root = root
+
+    def read(self, rel_path: str) -> str:
+        return (self.root / rel_path).read_text(encoding="utf-8")
+
+    def write(self, rel_path: str, content: str):
+        path = self.root / rel_path
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(content, encoding="utf-8")
+
+    def exists(self, rel_path: str) -> bool:
+        return (self.root / rel_path).exists()
+
+    def list(self, rel_path: str = "") -> List[str]:
+        full = self.root / rel_path
+        if not full.exists():
+            return []
+        return [str(p.relative_to(self.root)) for p in full.iterdir() if p.is_file()]
+
+    def delete(self, rel_path: str):
+        path = self.root / rel_path
+        if path.exists():
+            path.unlink()
+''')
+
+# ============================================================
+# 6. iOS Bridges (unchanged)
+# ============================================================
+write_file("bb/ios/__init__.py", "\"\"\"iOS native bridges.\"\"\"\n")
+write_file("bb/ios/keychain.py", '''
+\"\"\"iOS Keychain wrapper.\"\"\"
+from typing import Optional
+try:
+    import keychain as _keychain
+except ImportError:
+    _keychain = None
+
+class KeychainManager:
+    SERVICE = "com.bb.ios"
+
+    @classmethod
+    def set_key(cls, provider: str, key: str):
+        if _keychain:
+            _keychain.set_password(cls.SERVICE, provider, key)
+
+    @classmethod
+    def get_key(cls, provider: str) -> Optional[str]:
+        if _keychain:
+            try:
+                return _keychain.get_password(cls.SERVICE, provider)
+            except Exception:
+                return None
+        return None
+
+    @classmethod
+    def delete_key(cls, provider: str):
+        if _keychain:
+            try:
+                _keychain.delete_password(cls.SERVICE, provider)
+            except Exception:
+                pass
+''')
+
+write_file("bb/ios/shortcuts.py", '''
+\"\"\"iOS Shortcuts bridge (URL scheme).\"\"\"
+import webbrowser
+import urllib.parse
+from typing import Dict, Any
+
+class ShortcutsBridge:
+    @staticmethod
+    async def run_shortcut(name: str, params: Dict[str, Any] = None) -> str:
+        base = "shortcuts://run-shortcut"
+        query = {"name": name}
+        if params:
+            query.update(params)
+        url = f"{base}?{urllib.parse.urlencode(query)}"
+        webbrowser.open(url)
+        return f"Shortcut '{name}' triggered. Check Shortcuts app for result."
+''')
+
+write_file("bb/ios/notifications.py", '''
+\"\"\"Local notifications (Pyto's notify module).\"\"\"
+try:
+    import notify as _notify
+except ImportError:
+    _notify = None
+
+class NotificationsBridge:
+    @staticmethod
+    async def send_notification(title: str, body: str, identifier: str = "bb") -> str:
+        if _notify:
+            _notify.notify(title=title, body=body, identifier=identifier)
+            return f"Notification sent: {title}"
+        else:
+            print(f"NOTIFICATION: {title} - {body}")
+            return f"Notification would be sent (fallback): {title}"
+
+    @staticmethod
+    async def schedule_notification(title: str, body: str, delay_seconds: int, identifier: str = "bb") -> str:
+        # Placeholder – actual scheduling not implemented in Pyto's notify
+        return f"Scheduled notification (fallback) for {delay_seconds}s later – actual scheduling pending."
+''')
+
+# ============================================================
+# 7. Static files (PWA) – UPDATED with Provider Settings UI
+# ============================================================
+write_file("static/index.html", '''
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0, viewport-fit=cover">
+    <title>BB</title>
+    <link rel="stylesheet" href="style.css">
+</head>
+<body>
+    <div id="app">
+        <header>
+            <h1>BLACKBOX</h1>
+            <div id="controls">
+                <button id="settingsBtn" class="btn-secondary">Settings</button>
+                <button id="wheelBtn" class="btn-secondary">Take The Wheel</button>
+                <button id="auditBtn" class="btn-secondary">Audit</button>
+            </div>
+        </header>
+        <div id="chatContainer">
+            <div id="messages"></div>
+        </div>
+        <div id="inputArea">
+            <select id="agentSelect"></select>
+            <input type="text" id="inputField" placeholder="Ask BB..." autofocus>
+            <button id="sendBtn">Send</button>
+        </div>
+    </div>
+
+    <!-- Settings Modal -->
+    <div id="settingsModal" class="modal hidden">
+        <div class="modal-content" style="max-width:600px;">
+            <h2>Settings</h2>
+            <div id="settingsContent">
+                <h3>Providers</h3>
+                <div id="providerList"></div>
+                <hr>
+                <h3>Add Custom Provider</h3>
+                <form id="addProviderForm">
+                    <input type="text" id="providerName" placeholder="Name (e.g., ollama)" required>
+                    <input type="text" id="providerBaseURL" placeholder="Base URL (e.g., http://localhost:11434/v1)" required>
+                    <input type="text" id="providerAPIKey" placeholder="API Key (optional)">
+                    <input type="text" id="providerModel" placeholder="Default model (e.g., llama2)">
+                    <button type="submit">Add Provider</button>
+                </form>
+            </div>
+            <button id="closeSettingsBtn">Close</button>
+        </div>
+    </div>
+
+    <!-- Approval Modal -->
+    <div id="approvalModal" class="modal hidden">
+        <div class="modal-content">
+            <h2>Approval Required</h2>
+            <div id="approvalDetails"></div>
+            <div class="modal-actions">
+                <button id="approveBtn" class="btn-approve">Allow</button>
+                <button id="denyBtn" class="btn-deny">Deny</button>
+            </div>
+        </div>
+    </div>
+
+    <!-- Audit Modal -->
+    <div id="auditModal" class="modal hidden">
+        <div class="modal-content">
+            <h2>Audit Log</h2>
+            <div id="auditList"></div>
+            <button id="closeAuditBtn">Close</button>
+        </div>
+    </div>
+
+    <script src="script.js"></script>
+</body>
+</html>
+''')
+
+write_file("static/style.css", '''
+* { margin:0; padding:0; box-sizing:border-box; }
+body { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif; background:#000; color:#fff; height:100vh; display:flex; flex-direction:column; padding: env(safe-area-inset-top) env(safe-area-inset-right) env(safe-area-inset-bottom) env(safe-area-inset-left); }
+#app { display:flex; flex-direction:column; height:100%; max-width:800px; margin:0 auto; width:100%; }
+header { padding:16px 20px; display:flex; justify-content:space-between; align-items:center; border-bottom:1px solid #222; flex-shrink:0; }
+header h1 { font-size:20px; font-weight:600; letter-spacing:0.5px; }
+#controls { display:flex; gap:8px; }
+.btn-secondary { background:#222; border:none; color:#fff; padding:6px 12px; border-radius:6px; font-size:12px; cursor:pointer; }
+.btn-secondary:hover { background:#333; }
+#chatContainer { flex:1; overflow-y:auto; padding:16px 20px; }
+#messages { display:flex; flex-direction:column; gap:8px; }
+.message { padding:10px 14px; border-radius:12px; max-width:85%; word-wrap:break-word; font-size:16px; line-height:1.5; }
+.message.user { background:#1a1a1a; align-self:flex-end; border-bottom-right-radius:4px; }
+.message.assistant { background:#0a0a0a; align-self:flex-start; border-bottom-left-radius:4px; border:1px solid #1a1a1a; }
+.message.tool { background:#111; align-self:center; font-size:14px; color:#888; border:1px solid #222; max-width:95%; }
+.message .token { display:inline; }
+.message .tool-result { color:#4a9; }
+#inputArea { padding:12px 20px 20px; border-top:1px solid #222; display:flex; gap:10px; flex-shrink:0; align-items:center; flex-wrap:wrap; }
+#inputArea select { background:#111; color:#fff; border:1px solid #333; border-radius:6px; padding:8px; font-size:14px; }
+#inputField { flex:1; padding:12px 16px; border-radius:10px; border:1px solid #333; background:#111; color:#fff; font-size:16px; outline:none; min-width:150px; }
+#inputField:focus { border-color:#555; }
+#sendBtn { padding:12px 24px; border-radius:10px; border:none; background:#fff; color:#000; font-weight:600; font-size:16px; cursor:pointer; }
+#sendBtn:hover { background:#ddd; }
+.modal { position:fixed; top:0; left:0; width:100%; height:100%; background:rgba(0,0,0,0.8); display:flex; justify-content:center; align-items:center; z-index:1000; }
+.modal.hidden { display:none; }
+.modal-content { background:#1a1a1a; padding:24px; border-radius:16px; max-width:600px; width:95%; max-height:80vh; overflow-y:auto; }
+.modal-content h2, .modal-content h3 { margin-bottom:12px; }
+#providerList { margin:12px 0; }
+.provider-item { display:flex; justify-content:space-between; padding:8px; border-bottom:1px solid #333; font-size:14px; }
+.provider-item .name { font-weight:bold; }
+.provider-item .type { color:#888; }
+.provider-item .delete-btn { background:#a44; border:none; color:#fff; padding:2px 8px; border-radius:4px; cursor:pointer; }
+#addProviderForm { display:flex; flex-direction:column; gap:8px; margin-top:8px; }
+#addProviderForm input { padding:8px; border-radius:6px; border:1px solid #333; background:#111; color:#fff; }
+#addProviderForm button { padding:8px; border-radius:6px; border:none; background:#4a9; color:#000; font-weight:600; cursor:pointer; }
+#approvalDetails { background:#111; padding:12px; border-radius:8px; font-family:monospace; font-size:14px; margin:12px 0; white-space:pre-wrap; word-break:break-all; }
+.modal-actions { display:flex; gap:12px; margin-top:16px; }
+.modal-actions button { flex:1; padding:12px; border-radius:10px; border:none; font-weight:600; font-size:16px; cursor:pointer; }
+.btn-approve { background:#4a9; color:#000; }
+.btn-approve:hover { background:#5ba; }
+.btn-deny { background:#a44; color:#fff; }
+.btn-deny:hover { background:#b55; }
+#auditList { font-family:monospace; font-size:12px; max-height:400px; overflow-y:auto; background:#111; padding:12px; border-radius:8px; margin:12px 0; }
+#auditList .log-entry { padding:4px 0; border-bottom:1px solid #222; }
+#closeAuditBtn, #closeSettingsBtn { margin-top:12px; padding:10px 20px; border-radius:8px; border:none; background:#333; color:#fff; cursor:pointer; }
+''')
+
+write_file("static/script.js", '''
+const messagesContainer = document.getElementById('messages');
+const inputField = document.getElementById('inputField');
+const sendBtn = document.getElementById('sendBtn');
+const wheelBtn = document.getElementById('wheelBtn');
+const auditBtn = document.getElementById('auditBtn');
+const settingsBtn = document.getElementById('settingsBtn');
+const agentSelect = document.getElementById('agentSelect');
+
+let sessionId = localStorage.getItem('sessionId') || crypto.randomUUID();
+localStorage.setItem('sessionId', sessionId);
+let authToken = localStorage.getItem('bbAuthToken') || '';
+let currentAgent = 'fable';
+
+function addMessage(text, role, extra = {}) {
+    const div = document.createElement('div');
+    div.className = `message ${role}`;
+    if (role === 'assistant' && extra.partial) {
+        div.classList.add('streaming');
+        const tokenSpan = document.createElement('span');
+        tokenSpan.className = 'token';
+        tokenSpan.textContent = text;
+        div.appendChild(tokenSpan);
+    } else {
+        div.textContent = text;
+    }
+    messagesContainer.appendChild(div);
+    messagesContainer.scrollTop = messagesContainer.scrollHeight;
+    return div;
+}
+
+function updateStreamingMessage(element, text) {
+    const tokenSpan = element.querySelector('.token');
+    if (tokenSpan) {
+        tokenSpan.textContent += text;
+    } else {
+        const newSpan = document.createElement('span');
+        newSpan.className = 'token';
+        newSpan.textContent = text;
+        element.appendChild(newSpan);
+    }
+    messagesContainer.scrollTop = messagesContainer.scrollHeight;
+}
+
+async function sendMessage(text) {
+    if (!text.trim()) return;
+    addMessage(text, 'user');
+    inputField.value = '';
+    sendBtn.disabled = true;
+    let currentMsg = null;
+    try {
+        const response = await fetch('/chat', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json', 'X-API-Key': authToken },
+            body: JSON.stringify({
+                text: text,
+                session_id: sessionId,
+                agent_id: currentAgent
+            })
+        });
+        const reader = response.body.getReader();
+        const decoder = new TextDecoder();
+        while (true) {
+            const { value, done } = await reader.read();
+            if (done) break;
+            const chunk = decoder.decode(value);
+            const lines = chunk.split('\\n');
+            for (const line of lines) {
+                if (line.startsWith('data: ')) {
+                    try {
+                        const data = JSON.parse(line.slice(6));
+                        handleEvent(data, currentMsg, (msg) => { currentMsg = msg; });
+                    } catch (e) {}
+                }
+            }
+        }
+    } catch (error) {
+        console.error('Error:', error);
+        addMessage(`Error: ${error.message}`, 'assistant');
+    } finally {
+        sendBtn.disabled = false;
+        inputField.focus();
+    }
+}
+
+function handleEvent(data, currentMsg, setMsg) {
+    switch (data.type) {
+        case 'message':
+            if (data.partial) {
+                if (!currentMsg) {
+                    const msg = addMessage('', 'assistant', { partial: true });
+                    setMsg(msg);
+                    updateStreamingMessage(msg, data.content);
+                } else {
+                    updateStreamingMessage(currentMsg, data.content);
+                }
+            } else {
+                if (currentMsg) {
+                    if (data.content) updateStreamingMessage(currentMsg, data.content);
+                    currentMsg.classList.remove('streaming');
+                } else {
+                    addMessage(data.content, 'assistant');
+                }
+            }
+            break;
+        case 'tool.approval_required':
+            showApprovalModal(data);
+            break;
+        case 'error':
+            addMessage(`Error: ${data.content}`, 'assistant');
+            break;
+        case 'session.start':
+            console.log('Session started:', data.session_id);
+            break;
+        case 'session.end':
+            console.log('Session ended');
+            break;
+    }
+}
+
+function showApprovalModal(data) {
+    const modal = document.getElementById('approvalModal');
+    const details = document.getElementById('approvalDetails');
+    details.textContent = JSON.stringify(data, null, 2);
+    modal.classList.remove('hidden');
+    document.getElementById('approveBtn').onclick = () => {
+        fetch('/approve', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json', 'X-API-Key': authToken },
+            body: JSON.stringify({ approval_id: data.approval_id, decision: 'allow' })
+        });
+        modal.classList.add('hidden');
+    };
+    document.getElementById('denyBtn').onclick = () => {
+        fetch('/approve', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json', 'X-API-Key': authToken },
+            body: JSON.stringify({ approval_id: data.approval_id, decision: 'deny' })
+        });
+        modal.classList.add('hidden');
+    };
+}
+
+// ---- Settings UI ----
+async function loadProviders() {
+    try {
+        const resp = await fetch('/providers', { headers: { 'X-API-Key': authToken } });
+        const data = await resp.json();
+        return data;
+    } catch (e) {
+        console.error('Failed to load providers:', e);
+        return { providers: [], custom: {} };
+    }
+}
+
+async function loadAgents() {
+    try {
+        const resp = await fetch('/agents', { headers: { 'X-API-Key': authToken } });
+        const data = await resp.json();
+        return data.agents || [];
+    } catch (e) {
+        console.error('Failed to load agents:', e);
+        return [];
+    }
+}
+
+async function refreshAgentSelect() {
+    const agents = await loadAgents();
+    agentSelect.innerHTML = '';
+    agents.forEach(agent => {
+        const opt = document.createElement('option');
+        opt.value = agent.id;
+        opt.textContent = `${agent.name} (${agent.provider}: ${agent.model})`;
+        if (agent.id === currentAgent) opt.selected = true;
+        agentSelect.appendChild(opt);
+    });
+}
+
+agentSelect.addEventListener('change', async () => {
+    currentAgent = agentSelect.value;
+    // Optionally update the session's agent in the backend if needed
+});
+
+async function renderSettings() {
+    const data = await loadProviders();
+    const list = document.getElementById('providerList');
+    const builtin = data.providers.filter(p => !data.custom[p]);
+    const custom = Object.keys(data.custom);
+    list.innerHTML = '';
+    // Built-in
+    builtin.forEach(p => {
+        const div = document.createElement('div');
+        div.className = 'provider-item';
+        div.innerHTML = `<span class="name">${p}</span><span class="type">built-in</span>`;
+        list.appendChild(div);
+    });
+    // Custom
+    custom.forEach(name => {
+        const cfg = data.custom[name];
+        const div = document.createElement('div');
+        div.className = 'provider-item';
+        div.innerHTML = `
+            <span class="name">${name}</span>
+            <span class="type">custom (${cfg.base_url})</span>
+            <button class="delete-btn" data-provider="${name}">Delete</button>
+        `;
+        list.appendChild(div);
+    });
+    // Add delete handlers
+    list.querySelectorAll('.delete-btn').forEach(btn => {
+        btn.addEventListener('click', async () => {
+            const name = btn.dataset.provider;
+            if (!confirm(`Delete custom provider "${name}"?`)) return;
+            await fetch(`/providers/custom/${name}`, {
+                method: 'DELETE',
+                headers: { 'X-API-Key': authToken }
+            });
+            await renderSettings();
+            await refreshAgentSelect();
+        });
+    });
+}
+
+document.getElementById('addProviderForm').addEventListener('submit', async (e) => {
+    e.preventDefault();
+    const name = document.getElementById('providerName').value.trim();
+    const base_url = document.getElementById('providerBaseURL').value.trim();
+    const api_key = document.getElementById('providerAPIKey').value.trim();
+    const model = document.getElementById('providerModel').value.trim() || 'default';
+    if (!name || !base_url) return;
+    await fetch('/providers/custom', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json', 'X-API-Key': authToken },
+        body: JSON.stringify({ name, base_url, api_key, model })
+    });
+    document.getElementById('addProviderForm').reset();
+    await renderSettings();
+    await refreshAgentSelect();
+});
+
+settingsBtn.addEventListener('click', async () => {
+    const modal = document.getElementById('settingsModal');
+    await renderSettings();
+    modal.classList.remove('hidden');
+});
+document.getElementById('closeSettingsBtn').addEventListener('click', () => {
+    document.getElementById('settingsModal').classList.add('hidden');
+});
+
+sendBtn.addEventListener('click', () => sendMessage(inputField.value));
+inputField.addEventListener('keydown', (e) => {
+    if (e.key === 'Enter' && !e.shiftKey) {
+        e.preventDefault();
+        sendMessage(inputField.value);
+    }
+});
+
+wheelBtn.addEventListener('click', async () => {
+    isHumanOverride = !isHumanOverride;
+    const endpoint = isHumanOverride ? '/take_the_wheel' : '/release_the_wheel';
+    await fetch(endpoint, { method: 'POST', headers: { 'X-API-Key': authToken } });
+    wheelBtn.textContent = isHumanOverride ? 'Release Wheel' : 'Take The Wheel';
+    wheelBtn.style.background = isHumanOverride ? '#a44' : '#222';
+    addMessage(isHumanOverride ? '🔴 Human override enabled' : '🟢 Human override released', 'tool');
+});
+
+auditBtn.addEventListener('click', async () => {
+    const modal = document.getElementById('auditModal');
+    const list = document.getElementById('auditList');
+    const response = await fetch('/audit', { headers: { 'X-API-Key': authToken } });
+    const data = await response.json();
+    list.innerHTML = data.logs.map(log =>
+        `<div class="log-entry">[${log.timestamp.slice(0,19)}] ${log.agent_id} → ${log.tool} <span style="color: ${log.status === 'SUCCESS' ? '#4a9' : '#a44'}">${log.status}</span></div>`
+    ).join('');
+    modal.classList.remove('hidden');
+    document.getElementById('closeAuditBtn').onclick = () => modal.classList.add('hidden');
+});
+
+if (!authToken) {
+    const token = prompt('Enter BB local auth token (see Pyto console)');
+    if (token) {
+        authToken = token;
+        localStorage.setItem('bbAuthToken', token);
+    }
+}
+
+// Initial load
+refreshAgentSelect();
+''')
+
+# ============================================================
+# 8. README (updated)
+# ============================================================
+write_file("README.md", '''
+# BB iOS – Personal AI Operating Environment
+
+**Version:** 1.1.0  
+**New:** Custom API provider support.
+
+## Overview
+
+BB is an API‑first personal AI operating environment for iOS. It gives interchangeable AI agents governed access to a persistent body of tools, devices, and a shared Context Weaver workspace, while keeping execution, permissions, state, and the user’s Obsidian substrate under BB’s control.
+
+## Architecture
+
+- **Core Runtime** – orchestrates sessions, agents, and the tool loop.
+- **Tool Gateway** – single action boundary with fail‑closed policy, audit, and approval.
+- **Providers** – built‑in: Claude, OpenAI (Gemini deferred) + **custom OpenAI‑compatible providers**.
+- **Weaver** – semantic interface to Obsidian vault with FTS5 indexing.
+- **iOS Bridges** – Keychain, Shortcuts, Notifications.
+- **Event System** – SSE for real‑time UI updates.
+
+## Custom Providers
+
+You can now add any OpenAI‑compatible API provider (e.g., Ollama, LM Studio, vLLM, etc.) via the Settings panel.
+
+- **Name**: a unique identifier (e.g., `ollama`).
+- **Base URL**: the server endpoint, e.g., `http://localhost:11434/v1`.
+- **API Key**: optional, may be required by some providers.
+- **Default model**: the model name to use (e.g., `llama2`).
+
+Once added, the provider appears in the agent selector dropdown. You can switch agents to use the new provider.
+
+## Deployment
+
+1. Run the installer script in Pyto.
+2. Run `server.py` in Pyto.
+3. Note the local auth token in the console.
+4. Open Safari → `http://localhost:5100`.
+5. Enter the token when prompted.
+6. Add to Home Screen for full‑screen PWA.
+7. Go to Settings → Add Custom Provider.
+
+## Testing
+
+Run the Phase 5 test suite:
+- Keychain storage/retrieval
+- Shortcut execution
+- Notification send
+- Deny policy
+- Human override
+- Share endpoint
+- Weaver read/write
+- **Custom provider** – add and use a local LLM.
+
+## Known Limitations
+
+- `notification.schedule` is a placeholder.
+- Shortcuts run via URL scheme (no synchronous result).
+- One active SSE stream per session (409 Conflict).
+- Gemini adapter is deferred (not implemented).
+
+## License
+
+Proprietary – BB iOS v1.1.0
+''')
+
+# ============================================================
+# Completion report
+# ============================================================
+print(f"✅ BB iOS v{VERSION} installed successfully in {BASE}")
+print("")
+print("📁 Generated file tree:")
+for root, dirs, files in os.walk(BASE):
+    level = root.replace(str(BASE), "").count(os.sep)
+    indent = " " * 2 * level
+    print(f"{indent}{os.path.basename(root)}/")
+    subindent = " " * 2 * (level + 1)
+    for f in files:
+        print(f"{subindent}{f}")
+
+print("")
+print("▶️ To run: open bb_ios/server.py in Pyto and tap Run.")
+print("🔑 Local auth token will be printed in the console.")
+print("🔧 Custom providers can be added via the Settings panel in the UI.")
+print("📖 See README.md for deployment and testing instructions.")
